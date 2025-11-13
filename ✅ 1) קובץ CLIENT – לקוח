@@ -1,0 +1,74 @@
+from flask import Flask, request, jsonify
+from flask_socketio import SocketIO
+import time
+from core.db import db_conn, db_lock
+from core.maps_weather import geocode_address, get_real_distance
+from core.pricing import get_price_per_km, calculate_dynamic_multiplier
+from core.sms_email import send_sms
+
+app = Flask(_name_)
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+@app.route("/api/grok_order", methods=["POST"])
+def api_grok_order():
+    data = request.json or {}
+    origin_address = data.get("origin_address", "").strip()
+    dest_address = data.get("dest_address", "").strip()
+    phone = data.get("phone", "unknown")
+    client_email = data.get("email", "")
+
+    if not origin_address or not dest_address:
+        return jsonify({"reply": "חסר כתובת"}), 400
+
+    origin_geo = geocode_address(origin_address)
+    dest_geo = geocode_address(dest_address)
+    distance_data = get_real_distance(origin_geo["lat"], origin_geo["lng"], dest_address=dest_address)
+
+    area = "תל אביב"
+    hour = time.localtime().tm_hour
+    price_per_km = get_price_per_km(area)
+    mult, reason = calculate_dynamic_multiplier(area, hour, 50, 15, origin_geo["lat"], origin_geo["lng"])
+    price = round(price_per_km * distance_data["distance_km"] * mult, 1)
+
+    driver = "0509876543"
+
+    with db_lock:
+        conn = db_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO rides(user_phone, driver_phone, status, origin_address,
+            origin_lat, origin_lng, dest_address, dest_lat, dest_lng,
+            distance_km, duration_min, price, final_price, client_email, created_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            phone, driver, "pending",
+            origin_geo["address"], origin_geo["lat"], origin_geo["lng"],
+            dest_geo["address"], dest_geo["lat"], dest_geo["lng"],
+            distance_data["distance_km"], distance_data["duration_min"],
+            price, price, client_email, int(time.time())
+        ))
+        ride_id = cur.lastrowid
+        conn.commit()
+
+    reply = (
+        f"הזמנתי מונית!\n"
+        f"מ: {origin_geo['address']}\n"
+        f"ל: {dest_geo['address']}\n"
+        f"מרחק: {distance_data['distance_km']} ק\"מ\n"
+        f"מחיר: ₪{price}"
+    )
+
+    send_sms(phone, reply)
+    send_sms(driver, f"הזמנה חדשה מ: {origin_geo['address']}")
+
+    socketio.emit('new_message', {
+        'ride_id': ride_id,
+        'origin_address': origin_geo["address"],
+        'origin_lat': origin_geo["lat"],
+        'origin_lng': origin_geo["lng"]
+    }, room=f"ride_{ride_id}")
+
+    return jsonify({"reply": reply, "ride_id": ride_id, "price": price})
+
+if _name_ == "_main_":
+    socketio.run(app, port=5001, host="0.0.0.0", debug=True)
