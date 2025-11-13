@@ -1,0 +1,58 @@
+from flask import Flask, request, jsonify
+from core.db import db_conn, db_lock
+import time
+
+app = Flask(_name_)
+
+@app.route("/api/set_base_price", methods=["POST"])
+def set_base_price():
+    data = request.json or {}
+    price = data.get("price_per_km")
+
+    with db_lock:
+        conn = db_conn()
+        cur = conn.cursor()
+        cur.execute("UPDATE settings SET value=? WHERE key='price_per_km'", (price,))
+        cur.execute(
+            "INSERT INTO price_history(price_per_km, area, set_by, created_at) VALUES(?,?,?,?)",
+            (price, "כללי", "admin", int(time.time()))
+        )
+        conn.commit()
+
+    return jsonify({"status": "ok"})
+
+@app.route("/api/set_area_price", methods=["POST"])
+def set_area_price():
+    data = request.json or {}
+    area = data.get("area")
+    price = data.get("price_per_km")
+
+    with db_lock:
+        conn = db_conn()
+        cur = conn.cursor()
+        cur.execute("INSERT OR REPLACE INTO price_areas(area, price_per_km) VALUES(?,?)", (area, price))
+        conn.commit()
+
+    return jsonify({"status": "ok"})
+
+@app.route("/api/admin_full_data")
+def admin_full_data():
+    with db_lock:
+        conn = db_conn()
+        cur = conn.cursor()
+
+        cur.execute("SELECT value FROM settings WHERE key='price_per_km'")
+        base = cur.fetchone()["value"]
+
+        cur.execute("SELECT area, price_per_km FROM price_areas")
+        rows = cur.fetchall()
+
+        data = {r["area"]: r["price_per_km"] for r in rows}
+
+    return jsonify({
+        "global_price": base,
+        "area_prices": data
+    })
+
+if _name_ == "_main_":
+    app.run(port=5003, host="0.0.0.0", debug=True)
