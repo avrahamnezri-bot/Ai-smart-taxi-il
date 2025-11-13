@@ -1,0 +1,86 @@
+from flask import Flask, request, jsonify
+from flask_socketio import SocketIO
+from core.db import db_conn, db_lock
+from core.maps_weather import haversine
+from core.sms_email import send_receipt_email
+import time, uuid
+
+app = Flask(_name_)
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+@app.route("/api/update_driver_location", methods=["POST"])
+def update_driver_location():
+    data = request.json or {}
+    phone = data.get("driver_phone")
+    lat = data.get("lat")
+    lng = data.get("lng")
+
+    if not phone or lat is None or lng is None:
+        return jsonify({"error": "חסר"}), 400
+
+    with db_lock:
+        conn = db_conn()
+        cur = conn.cursor()
+
+        cur.execute("UPDATE drivers SET last_lat=?, last_lng=?, last_active=? WHERE phone=?",
+            (lat, lng, int(time.time()), phone))
+
+        cur.execute("SELECT id, origin_lat, origin_lng FROM rides WHERE driver_phone=? AND status='pending'", (phone,))
+        ride = cur.fetchone()
+
+        conn.commit()
+
+    if ride:
+        socketio.emit('location_update', {
+            'ride_id': ride["id"],
+            'lat': lat,
+            'lng': lng
+        }, room=f"ride_{ride['id']}")
+
+        if ride["origin_lat"] and ride["origin_lng"]:
+            dist = haversine(lat, lng, ride["origin_lat"], ride["origin_lng"])
+            if dist <= 500:
+                socketio.emit('nearby_alert', {
+                    'ride_id': ride["id"],
+                    'distance': round(dist)
+                }, room=f"ride_{ride['id']}")
+
+    return jsonify({"status": "ok"})
+
+@app.route("/api/driver_arrived", methods=["POST"])
+def driver_arrived():
+    data = request.json or {}
+    ride_id = data.get("ride_id")
+    payment_method = data.get("payment_method", "cash")
+    client_email = data.get("client_email", "")
+
+    with db_lock:
+        conn = db_conn()
+        cur = conn.cursor()
+
+        cur.execute("SELECT * FROM rides WHERE id=?", (ride_id,))
+        ride = cur.fetchone()
+
+        cur.execute("UPDATE rides SET status='completed', payment_method=? WHERE id=?", (payment_method, ride_id))
+        conn.commit()
+
+    receipt_number = f"REC-{int(time.time())}{str(uuid.uuid4())[:4].upper()}"
+
+    send_receipt_email(
+        client_email or f"{ride['user_phone']}@example.com",
+        {
+            "receipt_number": receipt_number,
+            "origin": ride["origin_address"],
+            "dest": ride["dest_address"],
+            "price": ride["final_price"],
+            "distance_km": ride["distance_km"],
+            "payment_method": payment_method
+        }
+    )
+
+    socketio.emit("ride_completed", {"ride_id": ride_id}, room=f"ride_{ride_id}")
+
+    return jsonify({"status": "ok", "receipt_number": receipt_number})
+
+if _name_ == "_main_":
+    socketio.run(app, port=5002, host="0.0.0.0", debug=True)
